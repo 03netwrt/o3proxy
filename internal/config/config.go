@@ -1,5 +1,7 @@
 package config
 
+import "fmt"
+
 // ProxyConfig defines one SOCKS5 proxy instance
 type ProxyConfig struct {
 	Port     int    `json:"port"`      // Listen port (e.g., 1081)
@@ -24,17 +26,26 @@ func DefaultConfig() *Config {
 	}
 }
 
-// GenerateProxies creates proxy configs with suffixes
+// GenerateProxies creates proxy configs with auto-generated suffixes
+// Supports any count (e.g., 50, 100) — suffixes like a1, b1, ... f9, a10, ...
 func (c *Config) GenerateProxies(prefix string) {
-	suffixes := []string{"a1", "b1", "c1", "d1", "e1", "f1", "a2", "b2", "c2", "d2",
-		"e2", "f2", "a3", "b3", "c3", "d3", "e3", "f3", "a4", "b4"}
 	c.Proxies = make([]ProxyConfig, 0, c.Count)
-	for i := 0; i < c.Count && i < len(suffixes); i++ {
-		suf := suffixes[i]
-		c.Proxies = append(c.Proxies, ProxyConfig{
-			Port:     c.BasePort + i,
-			Suffix:   suf,
-			SourceIP: prefix + "::" + suf,
-		})
+	letters := []string{"a", "b", "c", "d", "e", "f"}
+	idx := 0
+	num := 1
+	for len(c.Proxies) < c.Count {
+		for _, l := range letters {
+			if len(c.Proxies) >= c.Count {
+				break
+			}
+			suf := fmt.Sprintf("%s%d", l, num)
+			c.Proxies = append(c.Proxies, ProxyConfig{
+				Port:     c.BasePort + idx,
+				Suffix:   suf,
+				SourceIP: prefix + "::" + suf,
+			})
+			idx++
+		}
+		num++
 	}
 }
