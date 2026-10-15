@@ -110,8 +110,10 @@ func (s *Server) handleConn(client net.Conn) {
 		return
 	}
 
-	// Connect to destination with source IP binding
-	target := fmt.Sprintf("%s:%d", host, port)
+	// Connect to destination with source IP binding via NAT64
+	// Key insight (Latifan): the proxy must explicitly use NAT64.
+	// For IPv4 destinations, synthesize 64:ff9b::/96 address so the
+	// kernel routes via NAT64 with our bound IPv6 source.
 	dialer := &net.Dialer{
 		Timeout: 10 * time.Second,
 		LocalAddr: &net.TCPAddr{
@@ -119,16 +121,42 @@ func (s *Server) handleConn(client net.Conn) {
 		},
 	}
 
-	// Prefer IPv6 if source is IPv6
-	network := "tcp"
-	if net.ParseIP(s.SourceIP).To4() == nil {
-		// Source is IPv6, try tcp6 first for IPv6 destinations
-		// But allow fallback for IPv4 via NAT64
+	var server net.Conn
+
+	// Resolve destination to IP(s)
+	ips, resolveErr := net.LookupIP(host)
+	if resolveErr != nil || len(ips) == 0 {
+		// If host is already an IP literal, use it directly
+		if ip := net.ParseIP(host); ip != nil {
+			ips = []net.IP{ip}
+		} else {
+			client.Write([]byte{0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+			return
+		}
 	}
 
-	server, err := dialer.Dial(network, target)
-	if err != nil {
-		// Try with domain resolution
+	for _, ip := range ips {
+		var target string
+		var network string
+
+		if ip.To4() != nil {
+			// IPv4 destination → synthesize NAT64 IPv6 (64:ff9b::/96)
+			nat64 := synthesizeNAT64(ip)
+			target = fmt.Sprintf("[%s]:%d", nat64.String(), port)
+			network = "tcp6"
+		} else {
+			// IPv6 destination → direct
+			target = fmt.Sprintf("[%s]:%d", ip.String(), port)
+			network = "tcp6"
+		}
+
+		server, err = dialer.Dial(network, target)
+		if err == nil {
+			break
+		}
+	}
+
+	if err != nil || server == nil {
 		client.Write([]byte{0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		return
 	}
@@ -141,4 +169,24 @@ func (s *Server) handleConn(client net.Conn) {
 	// 5. Relay
 	go io.Copy(server, client)
 	io.Copy(client, server)
+}
+
+// synthesizeNAT64 converts an IPv4 to its NAT64 IPv6 equivalent
+// using the well-known prefix 64:ff9b::/96 (RFC 6052).
+// e.g., 1.1.1.1 -> 64:ff9b::101:101
+func synthesizeNAT64(ipv4 net.IP) net.IP {
+	v4 := ipv4.To4()
+	if v4 == nil {
+		return ipv4
+	}
+	// 64:ff9b::/96 + 32-bit IPv4
+	nat64 := make(net.IP, 16)
+	nat64[0] = 0x00
+	nat64[1] = 0x64
+	nat64[2] = 0xff
+	nat64[3] = 0x9b
+	// bytes 4-9 are zero (already)
+	// bytes 10-11 are zero (already, per RFC 6052 for /96)
+	copy(nat64[12:16], v4)
+	return nat64
 }
