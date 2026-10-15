@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/03netwrt/o3proxy/internal/config"
+	"github.com/03netwrt/o3proxy/internal/dashboard"
 	"github.com/03netwrt/o3proxy/internal/network"
 	"github.com/03netwrt/o3proxy/internal/proxy"
 )
@@ -18,8 +19,9 @@ func main() {
 		iface    = flag.String("iface", "wwan0", "Network interface")
 		basePort = flag.String("baseport", "1081", "Base SOCKS5 port")
 		count    = flag.String("count", "20", "Number of proxies")
-		action   = flag.String("action", "run", "Action: run|prefix|add|list")
+		action   = flag.String("action", "run", "Action: run|prefix|add|list|web")
 		addr     = flag.String("addr", "", "IPv6 CIDR (for add action)")
+		webAddr  = flag.String("web", "127.0.0.1:8080", "Dashboard listen address")
 	)
 	flag.Parse()
 
@@ -54,7 +56,18 @@ func main() {
 		}
 
 	case "run":
-		runProxies(*iface, *basePort, *count)
+		runProxies(*iface, *basePort, *count, *webAddr)
+
+	case "web":
+		var bp, c int
+		fmt.Sscanf(*basePort, "%d", &bp)
+		fmt.Sscanf(*count, "%d", &c)
+		dash := dashboard.New(bp, c, 10, "/data/local/tmp/earnapp-chroots")
+		fmt.Printf("Dashboard on http://%s\n", *webAddr)
+		if err := dash.Start(*webAddr); err != nil {
+			fmt.Fprintf(os.Stderr, "Dashboard error: %v\n", err)
+			os.Exit(1)
+		}
 
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown action: %s\n", *action)
@@ -62,7 +75,7 @@ func main() {
 	}
 }
 
-func runProxies(iface, basePortStr, countStr string) {
+func runProxies(iface, basePortStr, countStr, webAddr string) {
 	var basePort, count int
 	fmt.Sscanf(basePortStr, "%d", &basePort)
 	fmt.Sscanf(countStr, "%d", &count)
@@ -109,6 +122,13 @@ func runProxies(iface, basePortStr, countStr string) {
 
 	// Start prefix monitor (self-healing)
 	go monitorPrefix(iface, prefix, cfg, servers)
+
+	// Start web dashboard
+	dash := dashboard.New(basePort, count, 10, "/data/local/tmp/earnapp-chroots")
+	go func() {
+		fmt.Printf("Dashboard on http://%s\n", webAddr)
+		dash.Start(webAddr)
+	}()
 
 	// Wait for signal
 	sigCh := make(chan os.Signal, 1)
