@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 	"time"
 )
 
@@ -182,23 +183,48 @@ func (s *Server) handleConnect(client net.Conn, buf []byte, n int) {
 	io.Copy(client, server)
 }
 
+// nat64Prefix holds the discovered NAT64 prefix (RFC 7050).
+// Initialized at startup via network.DiscoverNAT64Prefix(), defaults to 64:ff9b::/96.
+var nat64Prefix = "64:ff9b::/96"
+
+// SetNAT64Prefix sets the NAT64 prefix used for IPv4 synthesis.
+// Called at startup after RFC 7050 discovery.
+func SetNAT64Prefix(prefix string) {
+	if prefix != "" {
+		nat64Prefix = prefix
+	}
+}
+
 // synthesizeNAT64 converts an IPv4 to its NAT64 IPv6 equivalent
-// using the well-known prefix 64:ff9b::/96 (RFC 6052).
-// e.g., 1.1.1.1 -> 64:ff9b::101:101
+// using the discovered prefix (RFC 6052 + RFC 7050).
+// e.g., 1.1.1.1 -> 64:ff9b::101:101 (with default /96 prefix)
 func synthesizeNAT64(ipv4 net.IP) net.IP {
 	v4 := ipv4.To4()
 	if v4 == nil {
 		return ipv4
 	}
-	// 64:ff9b::/96 + 32-bit IPv4
+	// Parse the prefix to get its bytes
+	prefixIP, prefixNet, err := net.ParseCIDR(nat64Prefix)
+	if err != nil {
+		// Fallback to well-known
+		prefixIP = net.ParseIP("64:ff9b::")
+		prefixNet = &net.IPNet{Mask: net.CIDRMask(96, 128)}
+	}
+	ones, _ := prefixNet.Mask.Size()
+
 	nat64 := make(net.IP, 16)
-	nat64[0] = 0x00
-	nat64[1] = 0x64
-	nat64[2] = 0xff
-	nat64[3] = 0x9b
-	// bytes 4-9 are zero (already)
-	// bytes 10-11 are zero (already, per RFC 6052 for /96)
-	copy(nat64[12:16], v4)
+	copy(nat64, prefixIP.To16())
+
+	if ones == 96 {
+		// /96: embed IPv4 in last 32 bits
+		copy(nat64[12:16], v4)
+	} else if ones == 64 {
+		// /64: embed IPv4 in bits 64-96
+		copy(nat64[8:12], v4)
+	} else {
+		// Unknown prefix length, fallback to /96 behavior
+		copy(nat64[12:16], v4)
+	}
 	return nat64
 }
 
@@ -209,9 +235,22 @@ func synthesizeNAT64(ipv4 net.IP) net.IP {
 func (s *Server) handleUDPAssociate(client net.Conn) {
 	defer client.Close()
 
-	// Create UDP relay socket bound to localhost (same port as TCP listener's IP)
-	// We bind to 127.0.0.1:0 and report the actual port.
-	udpAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
+	// Get the local address the client connected to (for BND.ADDR).
+	// This allows LAN/WiFi clients (not just localhost) to reach the relay.
+	// Falls back to 127.0.0.1 if we can't determine it.
+	bindIP := "127.0.0.1"
+	if localAddr, ok := client.LocalAddr().(*net.TCPAddr); ok && localAddr.IP != nil {
+		// Use the interface IP, not the client's IP
+		bindIP = localAddr.IP.String()
+		// If it's 0.0.0.0 (listening on all), use 127.0.0.1 for localhost clients
+		// or try to find a suitable LAN IP
+		if bindIP == "0.0.0.0" || bindIP == "::" {
+			bindIP = "127.0.0.1"
+		}
+	}
+
+	// Create UDP relay socket bound to the same IP the client used
+	udpAddr, err := net.ResolveUDPAddr("udp", bindIP+":0")
 	if err != nil {
 		return
 	}
@@ -222,10 +261,20 @@ func (s *Server) handleUDPAssociate(client net.Conn) {
 	defer relay.Close()
 
 	relayPort := relay.LocalAddr().(*net.UDPAddr).Port
+	relayIP := relay.LocalAddr().(*net.UDPAddr).IP
 
-	// Reply: VER(0x05) REP(0x00) RSV(0x00) ATYP(0x01 IPv4) BND.ADDR(127.0.0.1) BND.PORT
-	reply := []byte{0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1,
-		byte(relayPort >> 8), byte(relayPort & 0xff)}
+	// Reply: VER(0x05) REP(0x00) RSV(0x00) ATYP BND.ADDR BND.PORT
+	// Use ATYP 0x01 (IPv4) or 0x04 (IPv6) based on the bind IP
+	var reply []byte
+	if ip4 := relayIP.To4(); ip4 != nil {
+		reply = []byte{0x05, 0x00, 0x00, 0x01, ip4[0], ip4[1], ip4[2], ip4[3],
+			byte(relayPort >> 8), byte(relayPort & 0xff)}
+	} else {
+		ip16 := relayIP.To16()
+		reply = []byte{0x05, 0x00, 0x00, 0x04}
+		reply = append(reply, ip16...)
+		reply = append(reply, byte(relayPort>>8), byte(relayPort&0xff))
+	}
 	if _, err := client.Write(reply); err != nil {
 		return
 	}
@@ -240,6 +289,21 @@ func (s *Server) handleUDPAssociate(client net.Conn) {
 
 	// Source-bound UDP dialer for upstream
 	srcIP := net.ParseIP(s.SourceIP)
+
+	// Persistent UDP sessions keyed by destination (for QUIC/HTTP3/gaming)
+	sessions := make(map[string]*udpSession)
+	var sessionsMu sync.Mutex
+
+	// Cleanup all sessions when this function returns (TCP control closed)
+	defer func() {
+		sessionsMu.Lock()
+		for key, sess := range sessions {
+			close(sess.done)
+			sess.upstream.Close()
+			delete(sessions, key)
+		}
+		sessionsMu.Unlock()
+	}()
 
 	for {
 		// Short read deadline so we can exit when TCP control conn closes
@@ -302,63 +366,135 @@ func (s *Server) handleUDPAssociate(client net.Conn) {
 		}
 		payload := buf[dataStart:n]
 
-		// Resolve and send via source-bound UDP with NAT64 synthesis
-		// Use from (actual UDP source) not clientUDP (TCP addr)
-		go s.relayUDP(relay, from, srcIP, host, port, payload)
-	}
-}
-
-// relayUDP forwards one UDP payload to the destination and relays the
-// response back to the SOCKS5 client, wrapped in a SOCKS5 UDP header.
-func (s *Server) relayUDP(relay *net.UDPConn, clientUDP *net.UDPAddr, srcIP net.IP, host string, port int, payload []byte) {
-	// Resolve destination: check if it's already an IP first (avoid DNS lookup)
-	var ips []net.IP
-	if ip := net.ParseIP(host); ip != nil {
-		ips = []net.IP{ip}
-	} else {
-		var err error
-		ips, err = net.LookupIP(host)
-		if err != nil || len(ips) == 0 {
-			return
-		}
-	}
-
-	for _, ip := range ips {
-		var raddr *net.UDPAddr
-		if ip.To4() != nil {
-			nat64 := synthesizeNAT64(ip)
-			raddr = &net.UDPAddr{IP: nat64, Port: port}
+		// Resolve destination
+		var destIP net.IP
+		var destPort = port
+		if ip := net.ParseIP(host); ip != nil {
+			destIP = ip
 		} else {
-			raddr = &net.UDPAddr{IP: ip, Port: port}
+			ips, err := net.LookupIP(host)
+			if err != nil || len(ips) == 0 {
+				continue
+			}
+			destIP = ips[0]
 		}
 
-		// Dial UDP with source IP binding
-		laddr := &net.UDPAddr{IP: srcIP, Port: 0}
-		upstream, err := net.DialUDP("udp6", laddr, raddr)
-		if err != nil {
+		// Get or create persistent upstream session for this destination
+		destKey := destIP.String() + ":" + fmt.Sprintf("%d", destPort)
+
+		// Check if this is a new session (need to start reader)
+		sessionsMu.Lock()
+		_, exists := sessions[destKey]
+		sessionsMu.Unlock()
+
+		session := getOrCreateSession(sessions, &sessionsMu, destKey, srcIP, destIP, destPort)
+		if session == nil {
 			continue
 		}
 
-		upstream.SetDeadline(time.Now().Add(10 * time.Second))
-		if _, err := upstream.Write(payload); err != nil {
-			upstream.Close()
-			continue
+		// Start reader goroutine for new sessions
+		if !exists {
+			// Wait until we know clientUDP (from first datagram)
+			if clientUDP != nil {
+				startSessionReader(relay, clientUDP, session, sessions, &sessionsMu, destKey)
+			}
 		}
 
-		resp := make([]byte, 65535)
-		upstream.SetDeadline(time.Now().Add(10 * time.Second))
-		nr, err := upstream.Read(resp)
-		upstream.Close()
-		if err != nil || nr == 0 {
+		// Send via the persistent session
+		if _, err := session.upstream.Write(payload); err != nil {
+			// Session broken, remove it so next packet creates a new one
+			removeSession(sessions, &sessionsMu, destKey)
 			continue
 		}
-
-		// Wrap response in SOCKS5 UDP header and send back to client
-		out := buildUDPReply(ip, port, resp[:nr])
-		relay.WriteToUDP(out, clientUDP)
-		return
+		// Response will arrive via the session's reader goroutine
 	}
 }
+
+// udpSession holds a persistent upstream UDP connection for one destination.
+// Responses are forwarded back to the SOCKS5 client via the relay socket.
+type udpSession struct {
+	upstream *net.UDPConn
+	destIP   net.IP
+	destPort int
+	done     chan struct{}
+}
+
+// getOrCreateSession returns an existing session or creates a new one.
+// A reader goroutine is started for new sessions to forward responses.
+func getOrCreateSession(sessions map[string]*udpSession, mu *sync.Mutex, key string, srcIP, destIP net.IP, destPort int) *udpSession {
+	mu.Lock()
+	defer mu.Unlock()
+
+	if s, ok := sessions[key]; ok {
+		return s
+	}
+
+	// Resolve destination address (with NAT64 synthesis for IPv4)
+	var raddr *net.UDPAddr
+	if destIP.To4() != nil {
+		nat64 := synthesizeNAT64(destIP)
+		raddr = &net.UDPAddr{IP: nat64, Port: destPort}
+	} else {
+		raddr = &net.UDPAddr{IP: destIP, Port: destPort}
+	}
+
+	laddr := &net.UDPAddr{IP: srcIP, Port: 0}
+	upstream, err := net.DialUDP("udp6", laddr, raddr)
+	if err != nil {
+		return nil
+	}
+
+	s := &udpSession{
+		upstream: upstream,
+		destIP:   destIP,
+		destPort: destPort,
+		done:     make(chan struct{}),
+	}
+	sessions[key] = s
+	return s
+}
+
+// removeSession closes and removes a session from the map.
+func removeSession(sessions map[string]*udpSession, mu *sync.Mutex, key string) {
+	mu.Lock()
+	defer mu.Unlock()
+	if s, ok := sessions[key]; ok {
+		close(s.done)
+		s.upstream.Close()
+		delete(sessions, key)
+	}
+}
+
+// startSessionReader starts a goroutine that forwards upstream responses
+// back to the SOCKS5 client. Runs until the session is removed.
+func startSessionReader(relay *net.UDPConn, clientUDP *net.UDPAddr, s *udpSession, sessions map[string]*udpSession, mu *sync.Mutex, key string) {
+	go func() {
+		buf := make([]byte, 65535)
+		for {
+			select {
+			case <-s.done:
+				return
+			default:
+			}
+			s.upstream.SetReadDeadline(time.Now().Add(30 * time.Second))
+			n, err := s.upstream.Read(buf)
+			if err != nil {
+				if ne, ok := err.(net.Error); ok && ne.Timeout() {
+					continue
+				}
+				// Connection broken, clean up
+				removeSession(sessions, mu, key)
+				return
+			}
+			if n == 0 {
+				continue
+			}
+			out := buildUDPReply(s.destIP, s.destPort, buf[:n])
+			relay.WriteToUDP(out, clientUDP)
+		}
+	}()
+}
+
 
 // buildUDPReply wraps payload in a SOCKS5 UDP response header.
 func buildUDPReply(srcIP net.IP, srcPort int, payload []byte) []byte {
