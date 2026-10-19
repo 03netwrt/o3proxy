@@ -3,9 +3,74 @@ package network
 import (
 	"fmt"
 	"net"
+	"strings"
 
 	"github.com/vishvananda/netlink"
 )
+
+// Well-known NAT64 prefix (RFC 6052) — fallback if discovery fails
+const DefaultNAT64Prefix = "64:ff9b::/96"
+
+// DiscoverNAT64Prefix discovers the NAT64 prefix via RFC 7050.
+// It resolves ipv4only.arpa (which has well-known IPv4 192.0.0.170/171).
+// A DNS64 server synthesizes an IPv6; we extract the prefix from it.
+// Falls back to 64:ff9b::/96 if discovery fails.
+func DiscoverNAT64Prefix() string {
+	// Well-known IPv4 addresses for ipv4only.arpa (RFC 7050)
+	// 192.0.0.170 = c0:00:00:aa, 192.0.0.171 = c0:00:00:ab
+	ips, err := net.LookupIP("ipv4only.arpa")
+	if err != nil {
+		return DefaultNAT64Prefix
+	}
+
+	for _, ip := range ips {
+		if ip.To4() != nil {
+			continue // Skip plain IPv4, we want the synthesized IPv6
+		}
+		v6 := ip.To16()
+		if v6 == nil {
+			continue
+		}
+		// Check if it embeds 192.0.0.170 (c000:aa) or 192.0.0.171 (c000:ab)
+		// Common placements: last 32 bits (/96), or bits 64-96 (/64)
+		last32 := fmt.Sprintf("%02x%02x%02x%02x", v6[12], v6[13], v6[14], v6[15])
+		if last32 == "c00000aa" || last32 == "c00000ab" {
+			// /96 prefix: first 12 bytes
+			prefix := fmt.Sprintf("%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x::/96",
+				v6[0], v6[1], v6[2], v6[3], v6[4], v6[5],
+				v6[6], v6[7], v6[8], v6[9], v6[10], v6[11])
+			return normalizePrefix(prefix)
+		}
+		// Check /64 placement (bits 64-96)
+		mid32 := fmt.Sprintf("%02x%02x%02x%02x", v6[8], v6[9], v6[10], v6[11])
+		if mid32 == "c00000aa" || mid32 == "c00000ab" {
+			prefix := fmt.Sprintf("%02x%02x:%02x%02x:%02x%02x:%02x%02x::/64",
+				v6[0], v6[1], v6[2], v6[3], v6[4], v6[5], v6[6], v6[7])
+			return normalizePrefix(prefix)
+		}
+	}
+	return DefaultNAT64Prefix
+}
+
+// normalizePrefix compresses IPv6 prefix (removes leading zeros)
+func normalizePrefix(prefix string) string {
+	parts := strings.Split(strings.Split(prefix, "/")[0], ":")
+	var normalized []string
+	for _, p := range parts {
+		if p == "" {
+			normalized = append(normalized, "")
+			continue
+		}
+		// Remove leading zeros but keep at least one digit
+		trimmed := strings.TrimLeft(p, "0")
+		if trimmed == "" {
+			trimmed = "0"
+		}
+		normalized = append(normalized, trimmed)
+	}
+	plen := strings.Split(prefix, "/")[1]
+	return strings.Join(normalized, ":") + "/" + plen
+}
 
 // GetPrefix returns the /64 prefix from an interface's global IPv6 address
 // e.g., 2400:9800:262:540e:xxxx:... -> 2400:9800:262:540e
