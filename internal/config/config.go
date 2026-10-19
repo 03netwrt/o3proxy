@@ -67,7 +67,7 @@ func (c *Config) GenerateProxies(prefix string) {
 		c.Proxies = append(c.Proxies, ProxyConfig{
 			Port:     c.BasePort + i,
 			Suffix:   suf,
-			SourceIP: prefix + "::" + suf,
+			SourceIP: prefix + ":" + suf,
 		})
 	}
 }
