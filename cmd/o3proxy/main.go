@@ -80,6 +80,11 @@ func runProxies(iface, basePortStr, countStr, webAddr string) {
 	fmt.Sscanf(basePortStr, "%d", &basePort)
 	fmt.Sscanf(countStr, "%d", &count)
 
+	// Discover NAT64 prefix via RFC 7050 (fallback: 64:ff9b::/96)
+	nat64Prefix := network.DiscoverNAT64Prefix()
+	proxy.SetNAT64Prefix(nat64Prefix)
+	fmt.Printf("NAT64 prefix: %s\n", nat64Prefix)
+
 	// Get current prefix
 	prefix, err := network.GetPrefix(iface)
 	if err != nil {
