@@ -169,7 +169,7 @@ func monitorPrefix(iface, oldPrefix string, cfg *config.Config, servers []*proxy
 			oldCIDR := fmt.Sprintf("%s/64", p.SourceIP)
 			network.DelAddr(iface, oldCIDR)
 
-			newIP := newPrefix + "::" + p.Suffix
+			newIP := newPrefix + ":" + p.Suffix
 			newCIDR := fmt.Sprintf("%s/64", newIP)
 			network.AddAddr(iface, newCIDR)
 
